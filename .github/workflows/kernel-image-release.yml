@@ -1,0 +1,90 @@
+# 放到 mcajun87/Rocky7842_android_kernel_samsung_exynos9820 的
+# .github/workflows/kernel-image-release.yml
+#
+# 作用：git tag 触发，编一份精简 Image 并挂到 Release 上，
+#      你在本地直接下这个 Image 丢进 device/samsung/d1x/prebuilt/ 就能用。
+# 用法：
+#   git tag lean-v1 && git push origin lean-v1
+
+name: kernel-image-release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'lean-*'
+
+permissions:
+  contents: write
+
+env:
+  CLANG_TAG: android-16.0.0_r1
+  CLANG_VER: clang-r547379
+  DEFCONFIG: exynos9820-d1x_defconfig
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                       /opt/hostedtoolcache /usr/local/share/boost || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Toolchain deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev device-tree-compiler zip \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+
+      - name: Fetch clang
+        run: |
+          curl -fsSL -o /tmp/clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/${CLANG_TAG}/${CLANG_VER}.tar.gz"
+          mkdir -p "$HOME/clang"
+          tar -xf /tmp/clang.tar.gz -C "$HOME/clang"
+
+      - name: Build lean Image
+        run: |
+          set -eu
+          cp "arch/arm64/configs/${DEFCONFIG}" arch/arm64/configs/d1x_release_defconfig
+          ./scripts/config --file arch/arm64/configs/d1x_release_defconfig \
+            -d DEBUG_INFO -d DEBUG_KERNEL -d KALLSYMS_ALL \
+            -d IKCONFIG -d IKCONFIG_PROC \
+            -d FTRACE -d TRACEPOINTS -d FTRACE_SYSCALLS \
+            -d KPROBES -d BPF_SYSCALL -d PROFILING \
+            -d SCHEDSTATS -d TASKSTATS -d TASK_DELAY_ACCT -d PSI \
+            -d SLUB_DEBUG -d SECURITY_SELINUX_DEVELOP \
+            -d MAGIC_SYSRQ -d BLK_DEV_RAM -d SAMPLES
+          export PATH="$HOME/clang/bin:$PATH"
+          make -j"$(nproc)" ARCH=arm64 O=out \
+            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- d1x_release_defconfig
+          make -j"$(nproc)" ARCH=arm64 O=out \
+            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- Image
+          mkdir -p dist
+          cp out/arch/arm64/boot/Image "dist/Image-${GITHUB_REF_NAME}"
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          echo "字节: $(stat -c%s Image-${GITHUB_REF_NAME})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          gh release create "$GITHUB_REF_NAME" \
+            --title "d1x kernel Image $GITHUB_REF_NAME" \
+            --notes "精简 defconfig 编出的 Image，用于塞进 recovery 的 prebuilt/Image。sha256 见 SHA256SUMS.txt。" \
+            dist/*
