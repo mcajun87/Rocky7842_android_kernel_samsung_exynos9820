@@ -1,0 +1,243 @@
+# 放到 mcajun87/Rocky7842_android_kernel_samsung_exynos9820 仓库的
+# .github/workflows/kernel-image-release.yml
+#
+# 发布开关：Run workflow 面板里的「发布到 Releases」勾选框（type: boolean）
+#   不勾 = 只编译 + 上传 Artifact，不产生 Release
+#   勾上 = 编译 + 建 Release（Image + SHA256SUMS）
+# 打 tag 的规则：push lean-v1 只编不发；push pub-v1 编完发布。
+
+name: Kernel image release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '发布到 Releases'
+        type: boolean
+        default: false
+      copy_to_device_tree:
+        description: '同时把 Image 推到 d1x 设备树 prebuilt（需要 PAT secret）'
+        type: boolean
+        default: false
+      tag:
+        description: '发布 tag（留空自动生成 d1x-image-日期-时间）'
+        type: string
+        default: ''
+      ref:
+        description: '要编的分支'
+        type: choice
+        options:
+          - lineage-24.0
+          - lineage-24.0-ksu
+        default: lineage-24.0
+      variant:
+        description: '配置档'
+        type: choice
+        options:
+          - lean
+          - stock
+        default: lean
+  push:
+    tags:
+      - 'v*'
+      - 'lean-*'
+      - 'd1x-*'
+      - 'pub-*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kernel-image-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CLANG_TAG: android-16.0.0_r1
+  CLANG_VER: clang-r547379
+  RECOVERY_PARTITION: 67633152
+  DTBO_BYTES: 974848
+  BOOT_HEADER_BYTES: 2048
+  DEVICE_REPO: mcajun87/android_device_samsung_d1x
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                       /opt/hostedtoolcache /usr/local/share/boost || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref != '' && inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve tag and variant
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            VARIANT="${{ inputs.variant }}"
+            PUBLISH="${{ inputs.publish }}"
+          else
+            TAG="${{ github.ref_name }}"
+            case "$TAG" in
+              lean-*|v*) VARIANT="lean" ;;
+              *)         VARIANT="stock" ;;
+            esac
+            case "$TAG" in
+              pub-*) PUBLISH="true" ;;
+              *)     PUBLISH="false" ;;
+            esac
+          fi
+          [ -n "$TAG" ] || TAG="d1x-image-$(date -u +%Y%m%d-%H%M)"
+          [ -n "$VARIANT" ] || VARIANT="lean"
+          [ -n "${PUBLISH:-}" ] || PUBLISH="false"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VARIANT=$VARIANT" >> "$GITHUB_ENV"
+          echo "PUBLISH=$PUBLISH" >> "$GITHUB_ENV"
+          {
+            echo "### 开关状态"
+            echo ""
+            echo "| tag | variant | 发布 |"
+            echo "| --- | --- | --- |"
+            echo "| $TAG | $VARIANT | $PUBLISH |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Toolchain deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev device-tree-compiler zip \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+
+      - name: Fetch clang
+        run: |
+          curl -fsSL -o /tmp/clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/${CLANG_TAG}/${CLANG_VER}.tar.gz"
+          mkdir -p "$HOME/clang"
+          tar -xf /tmp/clang.tar.gz -C "$HOME/clang"
+          "$HOME/clang/bin/clang" --version | head -1
+
+      - name: Build Image
+        run: |
+          set -eu
+          cp arch/arm64/configs/exynos9820-d1x_defconfig arch/arm64/configs/d1x_release_defconfig
+          if [ "$VARIANT" = "lean" ]; then
+            ./scripts/config --file arch/arm64/configs/d1x_release_defconfig \
+              -d DEBUG_INFO -d DEBUG_KERNEL -d KALLSYMS_ALL \
+              -d IKCONFIG -d IKCONFIG_PROC \
+              -d FTRACE -d TRACEPOINTS -d FTRACE_SYSCALLS \
+              -d KPROBES -d BPF_SYSCALL -d PROFILING \
+              -d SCHEDSTATS -d TASKSTATS -d TASK_DELAY_ACCT -d PSI \
+              -d SLUB_DEBUG -d SECURITY_SELINUX_DEVELOP \
+              -d MAGIC_SYSRQ -d BLK_DEV_RAM -d SAMPLES
+          fi
+          echo "enabled: $(grep -c '^CONFIG_.*=y' arch/arm64/configs/d1x_release_defconfig)"
+          export PATH="$HOME/clang/bin:$PATH"
+          make -j"$(nproc)" ARCH=arm64 O=out \
+            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- d1x_release_defconfig
+          make -j"$(nproc)" ARCH=arm64 O=out \
+            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- Image
+          mkdir -p dist
+          cp out/arch/arm64/boot/Image "dist/Image-$TAG"
+          ( cd dist && sha256sum "Image-$TAG" > SHA256SUMS.txt )
+          BYTES=$(stat -c%s "dist/Image-$TAG")
+          BUDGET=$(( RECOVERY_PARTITION - BYTES - DTBO_BYTES - BOOT_HEADER_BYTES ))
+          {
+            echo "### 产物"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| Image 字节 | $BYTES |"
+            echo "| 留给 ramdisk（压缩后） | $BUDGET |"
+            echo "| variant | $VARIANT |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write notes
+        run: |
+          set -eu
+          BYTES=$(stat -c%s "dist/Image-$TAG")
+          BUDGET=$(( RECOVERY_PARTITION - BYTES - DTBO_BYTES - BOOT_HEADER_BYTES ))
+          {
+            echo "# d1x 内核 Image · $TAG"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| Image 字节 | $BYTES |"
+            echo "| 给 ramdisk 的额度（去掉 dtbo 与 header） | $BUDGET |"
+            echo "| variant | $VARIANT |"
+            echo "| 源码 commit | $(git rev-parse --short HEAD) |"
+            echo ""
+            echo "## 用法"
+            echo ""
+            echo '```'
+            echo "覆盖到 device/samsung/d1x/prebuilt/Image 后：mka recoveryimage"
+            echo '```'
+          } > dist/NOTES.md
+
+      - name: Upload artifact（不发布也留一份）
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-${{ env.TAG }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release（开关打开才跑）
+        if: ${{ env.PUBLISH == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/Image-"$TAG" dist/SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --notes-file dist/NOTES.md
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            gh release create "$TAG" dist/Image-"$TAG" dist/SHA256SUMS.txt \
+              --target "$(git rev-parse HEAD)" \
+              --title "d1x kernel Image $TAG" \
+              --notes-file dist/NOTES.md
+          else
+            gh release create "$TAG" dist/Image-"$TAG" dist/SHA256SUMS.txt \
+              --title "d1x kernel Image $TAG" \
+              --notes-file dist/NOTES.md
+          fi
+          echo "已发布：${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Skipped publishing
+        if: ${{ env.PUBLISH != 'true' }}
+        run: echo "发布开关关闭，只留 Artifact，没有建 Release。" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push Image into device tree（开关打开才跑）
+        if: ${{ inputs.copy_to_device_tree }}
+        env:
+          DEVICE_PAT: ${{ secrets.DEVICE_TREE_PAT }}
+        run: |
+          set -eu
+          if [ -z "${DEVICE_PAT:-}" ]; then
+            echo "::warning::没配 DEVICE_TREE_PAT，跳过推送。手动把 Image-$TAG 覆盖到设备树即可。"
+            exit 0
+          fi
+          git clone --depth 1 -b fox_16.0 \
+            "https://x-access-token:${DEVICE_PAT}@github.com/${DEVICE_REPO}.git" devtree
+          cp "dist/Image-$TAG" devtree/prebuilt/Image
+          cd devtree
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Image 没变化，不用提交"
+            exit 0
+          fi
+          git add prebuilt/Image
+          git commit -m "prebuilt: Image from $TAG ($(stat -c%s prebuilt/Image) bytes)"
+          git push
+          echo "已推送到 ${DEVICE_REPO} fox_16.0" >> "$GITHUB_STEP_SUMMARY"
