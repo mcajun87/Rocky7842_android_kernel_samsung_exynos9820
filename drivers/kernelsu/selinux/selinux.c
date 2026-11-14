@@ -25,6 +25,13 @@ static u32 cached_adbd_sid __read_mostly = 0;
 static u32 cached_init_sid __read_mostly = 0;
 u32 ksu_file_sid __read_mostly = 0;
 
+#ifdef CONFIG_KSU_SUSFS
+/* SUSFS: security/selinux/avc.c 与 fs/susfs.c 以 extern 引用这两个 sid */
+u32 susfs_ksu_sid __read_mostly = 0;
+u32 susfs_priv_app_sid __read_mostly = 0;
+#define KERNEL_PRIV_APP_DOMAIN "u:r:priv_app:s0:c512,c768"
+#endif
+
 static int transive_to_domain(const char *domain, struct cred *cred, bool clear_exec_sid)
 {
     struct task_security_struct *tsec;
@@ -171,6 +178,13 @@ void cache_sid(void)
         cached_su_sid = 0;
     } else {
         pr_info("Cached su SID: %u\n", cached_su_sid);
+#ifdef CONFIG_KSU_SUSFS
+        /* SUSFS: 同步 KSU 域 sid 与 priv_app sid 给 SUSFS/AVC 日志伪装使用 */
+        susfs_ksu_sid = cached_su_sid;
+        if (security_secctx_to_secid(KERNEL_PRIV_APP_DOMAIN,
+                                       strlen(KERNEL_PRIV_APP_DOMAIN), &susfs_priv_app_sid))
+        	susfs_priv_app_sid = 0;
+#endif
     }
 
     err = security_secctx_to_secid(ZYGOTE_CONTEXT, strlen(ZYGOTE_CONTEXT),
@@ -285,3 +299,11 @@ void escape_to_root_for_adb_root(void)
     }
     commit_creds(cred);
 }
+
+#ifdef CONFIG_KSU_SUSFS
+/* SUSFS 需要判断当前进程是否处于 KernelSU 域（SUSFS 在 fs/ 里以 extern 声明） */
+bool susfs_is_current_ksu_domain(void)
+{
+	return is_ksu_domain();
+}
+#endif

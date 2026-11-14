@@ -1,4 +1,7 @@
 #include <linux/err.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs.h>
+#endif
 #include <linux/fs.h>
 #include <linux/namei.h>
 #include <linux/printk.h>
@@ -107,6 +110,9 @@ void on_module_mounted(void)
 void on_boot_completed(void)
 {
     ksu_boot_completed = true;
+#ifdef CONFIG_KSU_SUSFS
+    susfs_set_boot_completed_triggered();
+#endif
     pr_info("on_boot_completed!\n");
     track_throne(true);
     ksu_avc_spoof_late_init();

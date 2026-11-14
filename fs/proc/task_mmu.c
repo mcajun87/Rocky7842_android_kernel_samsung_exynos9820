@@ -23,6 +23,9 @@
 #include <linux/io_record.h>
 #include <linux/freezer.h>
 
+#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP)
+#include <linux/susfs_def.h>
+#endif
 #include <asm/elf.h>
 #include <asm/tlb.h>
 #include <asm/tlbflush.h>
@@ -33,7 +36,12 @@
 #include "../../drivers/block/zram/zram_drv.h"
 #endif
 
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+extern void susfs_sus_ino_for_show_map_vma(unsigned long ino, dev_t *out_dev, unsigned long *out_ino);
+#endif
+
 void task_mem(struct seq_file *m, struct mm_struct *mm)
+
 {
 	unsigned long text, lib, swap, anon, file, shmem;
 	unsigned long hiwater_vm, total_vm, hiwater_rss, total_rss;
@@ -388,8 +396,29 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
 
 	if (file) {
 		struct inode *inode = file_inode(vma->vm_file);
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+	/*
+	 * SUSFS: 把打了 BIT_SUS_MAPS 标记的文件伪装成匿名可执行映射。
+	 * 4.14 没有 seq_put_hex_ll()，这里复用内核原生的 show_vma_header_prefix()：
+	 * flags 传 0 时输出的恰好是 SUSFS 期望的 "---p"，dev/ino/pgoff 全 0，
+	 * 随后 goto done 跳过 dentry 名字打印。
+	 */
+	if (unlikely(inode->i_mapping->flags & BIT_SUS_MAPS) && susfs_is_current_proc_umounted()) {
+		show_vma_header_prefix(m, vma->vm_start, vma->vm_end, 0, 0, 0, 0);
+		goto done;
+	}
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+		if (unlikely(inode->i_mapping->flags & BIT_SUS_KSTAT)) {
+			susfs_sus_ino_for_show_map_vma(inode->i_ino, &dev, &ino);
+			goto bypass_orig_flow;
+		}
+#endif
 		dev = inode->i_sb->s_dev;
 		ino = inode->i_ino;
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+bypass_orig_flow:
+#endif
 		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
 	}
 
@@ -920,6 +949,7 @@ static int show_smap(struct seq_file *m, void *v, int is_pid)
 			   (vma->vm_end - vma->vm_start) >> 10,
 			   vma_kernel_pagesize(vma) >> 10,
 			   vma_mmu_pagesize(vma) >> 10);
+
 
 
 	if (!rollup_mode || last_vma)
@@ -1601,6 +1631,9 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
 	unsigned long start_vaddr;
 	unsigned long end_vaddr;
 	int ret = 0, copied = 0;
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+	struct vm_area_struct *vma;
+#endif
 
 	if (!mm || !mmget_not_zero(mm))
 		goto out;
@@ -1659,6 +1692,16 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
 		down_read(&mm->mmap_sem);
 		ret = walk_page_range(start_vaddr, end, &pagemap_walk);
 		up_read(&mm->mmap_sem);
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+		vma = find_vma(mm, start_vaddr);
+		if (vma && vma->vm_file) {
+			struct inode *inode = file_inode(vma->vm_file);
+			if (unlikely(inode->i_mapping->flags & BIT_SUS_MAPS) && susfs_is_current_proc_umounted()) {
+				pm.show_pfn = false;
+				pm.buffer->pme = 0;
+			}
+		}
+#endif
 		start_vaddr = end;
 
 		len = min(count, PM_ENTRY_BYTES * pm.pos);

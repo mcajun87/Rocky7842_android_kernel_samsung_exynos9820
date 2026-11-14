@@ -79,7 +79,8 @@ static void ksu_sys_umount(const char *mnt, int flags)
 
 #endif
 
-static void try_umount(const char *mnt, int flags)
+/* SUSFS: fs/susfs.c 以 extern void try_umount(const char *, int) 引用，不能是 static */
+void try_umount(const char *mnt, int flags)
 {
 	struct path path;
 	int err = kern_path(mnt, 0, &path);

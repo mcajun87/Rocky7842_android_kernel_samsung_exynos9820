@@ -294,3 +294,16 @@ void __exit ksu_sucompat_exit()
 {
 	ksu_unregister_feature_handler(KSU_FEATURE_SU_COMPAT);
 }
+
+#ifdef CONFIG_KSU_SUSFS
+/*
+ * SUSFS 的 fs/devpts/inode.c 会调用 ksu_handle_devpts()。
+ * 4.14 上没有 selinux_inode() 辅助函数，第一版先提供空实现保证可编译，
+ * 后续再补 inode sid 修正（不影响 SUSFS 主要隐藏功能）。
+ */
+int ksu_handle_devpts(struct inode *inode)
+{
+	(void)inode;
+	return 0;
+}
+#endif

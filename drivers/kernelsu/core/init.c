@@ -1,4 +1,7 @@
 #include <linux/export.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs.h>
+#endif
 #include <linux/fs.h>
 #include <linux/kobject.h>
 #include <linux/module.h>
@@ -147,6 +150,9 @@ int __init kernelsu_init(void)
 
 	ksu_selinux_hide_init();
 
+#ifdef CONFIG_KSU_SUSFS
+	susfs_init();
+#endif
 	ksu_supercalls_init();
 
 	ksu_app_profile_init();
